@@ -1,1 +1,25 @@
+name: Build PSP
 
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: pspdev/pspdev:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libraries
+        run: |
+          psp-pacman -Sy --noconfirm libmad libpng zlib || true
+          psp-pacman -S --noconfirm libjpeg-turbo || psp-pacman -S --noconfirm libjpeg || true
+
+      - name: Build
+        run: make
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MediaPlayer
+          path: EBOOT.PBP
