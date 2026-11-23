@@ -18,6 +18,13 @@
 #include <mad.h>
 #include <jpeglib.h>
 #include <png.h>
+#ifdef HAVE_FFMPEG
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+#include <libavutil/avutil.h>
+#endif
 #include <time.h>
 #include "font.h"
 #include "assets.h"
@@ -452,6 +459,12 @@ static int is_mp3(const char *p) { return has_ext(p, "mp3"); }
 static int is_jpeg(const char *p) { return has_ext(p, "jpg,jpeg"); }
 static int is_bmp(const char *p) { return has_ext(p, "bmp"); }
 static int is_viewable(const char *p) { return has_ext(p, "jpg,jpeg,png,bmp"); }
+#ifdef HAVE_FFMPEG
+static int is_video_playable(const char *p) { return has_ext(p, "mp4,m4v,avi,mkv,mov,3gp,flv,wmv,mpg,mpeg"); }
+#else
+static int is_avi(const char *p) { return has_ext(p, "avi"); }
+static int is_video_playable(const char *p) { return is_avi(p); }
+#endif
 static const char *base(const char *p) { const char *s = strrchr(p, '/'); return s ? s + 1 : p; }
 static const char *type_upper(int t) {
   return t == T_DIR ? TR("ПАПКА") : t == T_AUDIO ? TR("МУЗЫКА") : t == T_VIDEO ? TR("ВИДЕО") : t == T_IMAGE ? TR("ФОТО") : TR("ФАЙЛ");
@@ -939,6 +952,360 @@ static void photo_viewer(View *v, int pos) {
   if (im) free(im);
 }
 
+
+#ifndef HAVE_FFMPEG
+/* ================= video (AVI: MJPEG + 16-bit PCM) ================= */
+static uint32_t avi_u32(const unsigned char *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint16_t avi_u16(const unsigned char *p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static void video_player_avi(const char *path) {
+  /* stop background music so we don't share the audio channel */
+  a_stop = 1; nq = 0;
+  for (int t = 0; a_playing && t < 100; t++) sceKernelDelayThread(10000);
+
+  FILE *f = fopen(path, "rb");
+  if (!f) { set_msg(TR("Не удалось открыть видео")); return; }
+
+  unsigned char hdr[12];
+  if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) || memcmp(hdr + 8, "AVI ", 4)) {
+    fclose(f); set_msg(TR("Поддерживается только AVI (MJPEG)")); return;
+  }
+
+  uint32_t us_per_frame = 41667; /* default ~24 fps */
+  int aud_ok = 0, aud_ch = 2, aud_rate = 44100, aud_bits = 16;
+  long movi_pos = -1, movi_end = 0;
+  int in_aud_strl = 0;
+
+  while (1) {
+    unsigned char ch[8];
+    if (fread(ch, 1, 8, f) != 8) break;
+    uint32_t sz = avi_u32(ch + 4);
+    long next = ftell(f) + (long)((sz + 1u) & ~1u);
+
+    if (!memcmp(ch, "LIST", 4) && sz >= 4) {
+      unsigned char lt[4];
+      if (fread(lt, 1, 4, f) != 4) break;
+      if (!memcmp(lt, "movi", 4)) { movi_pos = ftell(f); movi_end = next; break; }
+      if (!memcmp(lt, "hdrl", 4) || !memcmp(lt, "strl", 4)) {
+        if (!memcmp(lt, "strl", 4)) in_aud_strl = 0;
+        continue;
+      }
+    } else if (!memcmp(ch, "avih", 4) && sz >= 4) {
+      unsigned char b[4];
+      if (fread(b, 1, 4, f) == 4) {
+        uint32_t u = avi_u32(b);
+        if (u >= 10000 && u <= 200000) us_per_frame = u;
+      }
+    } else if (!memcmp(ch, "strh", 4) && sz >= 4) {
+      unsigned char b[4];
+      if (fread(b, 1, 4, f) == 4 && !memcmp(b, "auds", 4)) in_aud_strl = 1;
+    } else if (!memcmp(ch, "strf", 4) && in_aud_strl && sz >= 16) {
+      unsigned char b[16];
+      if (fread(b, 1, 16, f) == 16) {
+        if (avi_u16(b) == 1) { /* WAVE_FORMAT_PCM */
+          aud_ch = avi_u16(b + 2);
+          aud_rate = (int)avi_u32(b + 4);
+          aud_bits = avi_u16(b + 14);
+          if ((aud_ch == 1 || aud_ch == 2) && aud_bits == 16 && aud_rate >= 8000 && aud_rate <= 48000)
+            aud_ok = 1;
+        }
+      }
+      in_aud_strl = 0;
+    }
+    if (fseek(f, next, SEEK_SET) != 0) break;
+  }
+
+  if (movi_pos < 0) { fclose(f); set_msg(TR("Повреждённый AVI файл")); return; }
+
+  int psp_ch = -1;
+  if (aud_ok) psp_ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, 1152, PSP_AUDIO_FORMAT_STEREO);
+  if (psp_ch < 0) aud_ok = 0;
+
+  static short v_abuf[1152 * 2] __attribute__((aligned(64)));
+  int afill = 0;
+  long long astep = ((long long)aud_rate << 16) / 44100, aacc = 0;
+  short apl = 0, apr = 0;
+
+  unsigned char *buf = NULL;
+  size_t bcap = 0;
+  int paused = 0, show_hud = 1, frames = 0;
+  uint64_t next_t = sceKernelGetSystemTimeWide();
+
+  fseek(f, movi_pos, SEEK_SET);
+  while (ftell(f) < movi_end) {
+    unsigned p = read_pad();
+    if (p & PSP_CTRL_CIRCLE) break;
+    if (p & PSP_CTRL_SQUARE) { paused = !paused; next_t = sceKernelGetSystemTimeWide(); }
+    if (p & PSP_CTRL_TRIANGLE) show_hud = !show_hud;
+    if (p & PSP_CTRL_UP) vol_change(0x800);
+    if (p & PSP_CTRL_DOWN) vol_change(-0x800);
+
+    if (paused) { sceDisplayWaitVblankStart(); continue; }
+
+    unsigned char ch[8];
+    if (fread(ch, 1, 8, f) != 8) break;
+    uint32_t sz = avi_u32(ch + 4);
+    uint32_t pad = sz & 1u;
+
+    if (!memcmp(ch, "LIST", 4)) { fseek(f, 4, SEEK_CUR); continue; }
+
+    int is_vid = (ch[2] == 'd' && (ch[3] == 'c' || ch[3] == 'b'));
+    int is_aud = (ch[2] == 'w' && ch[3] == 'b' && aud_ok);
+
+    if ((is_vid || is_aud) && sz > 0 && sz < 2 * 1024 * 1024) {
+      if (sz > bcap) {
+        unsigned char *nb = realloc(buf, sz);
+        if (!nb) break;
+        buf = nb; bcap = sz;
+      }
+      if (fread(buf, 1, sz, f) != sz) break;
+      if (pad) fseek(f, 1, SEEK_CUR);
+
+      if (is_vid) {
+        int w = 0, h = 0;
+        uint32_t *im = jpeg_decode(NULL, buf, sz, &w, &h, SW, SH, 1000000);
+        if (im) {
+          for (int i = 0; i < SW * SH; i++) fb[i] = C_BLACK;
+          blit_fit(im, w, h, 0, 0, SW, SH);
+          free(im);
+          if (show_hud) {
+            int sec = (int)((uint64_t)frames * us_per_frame / 1000000ULL);
+            char tb[32]; snprintf(tb, sizeof tb, "%02d:%02d", sec / 60, sec % 60);
+            fill_rect(0, SH - 24, SW, 24, C_DARK, 175);
+            draw_text(&FONT_S, 10, SH - 20, C_WHITE, base(path), 360, 0);
+            draw_text_r(&FONT_S, SW - 10, SH - 20, C_GRAY, tb);
+          }
+          uint64_t now = sceKernelGetSystemTimeWide();
+          if (now < next_t) sceKernelDelayThread((SceUInt)(next_t - now));
+          next_t = sceKernelGetSystemTimeWide() + us_per_frame;
+          flip(0);
+          frames++;
+        }
+      } else if (is_aud) {
+        int step_b = aud_ch * 2;
+        int nsamp = (int)(sz / step_b);
+        for (int i = 0; i < nsamp; i++) {
+          short l = (short)avi_u16(buf + i * step_b);
+          short r = aud_ch == 2 ? (short)avi_u16(buf + i * step_b + 2) : l;
+          while (aacc < 65536) {
+            v_abuf[afill * 2] = apl + (short)(((long long)(l - apl) * aacc) >> 16);
+            v_abuf[afill * 2 + 1] = apr + (short)(((long long)(r - apr) * aacc) >> 16);
+            afill++;
+            if (afill == 1152) { sceAudioOutputBlocking(psp_ch, a_vol, v_abuf); afill = 0; }
+            aacc += astep;
+          }
+          aacc -= 65536; apl = l; apr = r;
+        }
+      }
+    } else {
+      fseek(f, (long)(sz + pad), SEEK_CUR);
+    }
+  }
+
+  if (buf) free(buf);
+  if (psp_ch >= 0) sceAudioChRelease(psp_ch);
+  fclose(f);
+}
+#endif
+
+#ifdef HAVE_FFMPEG
+/* ================= video (MP4 / MKV / AVI via FFmpeg) ================= */
+static void video_player_ffmpeg(const char *path) {
+  a_stop = 1; nq = 0;
+  for (int t = 0; a_playing && t < 100; t++) sceKernelDelayThread(10000);
+
+  splash(TR("Загрузка видео..."), base(path));
+
+  AVFormatContext *fmt = NULL;
+  if (avformat_open_input(&fmt, path, NULL, NULL) < 0) {
+    set_msg(TR("Не удалось открыть видео")); return;
+  }
+  if (avformat_find_stream_info(fmt, NULL) < 0) {
+    avformat_close_input(&fmt); set_msg(TR("Не удалось открыть видео")); return;
+  }
+
+  int vidx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+  int aidx = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+  if (vidx < 0) {
+    avformat_close_input(&fmt); set_msg(TR("Видеопоток не найден")); return;
+  }
+
+  const AVCodec *vc = avcodec_find_decoder(fmt->streams[vidx]->codecpar->codec_id);
+  AVCodecContext *vctx = vc ? avcodec_alloc_context3(vc) : NULL;
+  if (!vctx || avcodec_parameters_to_context(vctx, fmt->streams[vidx]->codecpar) < 0) {
+    if (vctx) avcodec_free_context(&vctx);
+    avformat_close_input(&fmt); set_msg(TR("Неподдерживаемый видеокодек")); return;
+  }
+  vctx->skip_loop_filter = AVDISCARD_ALL;
+  vctx->flags2 |= AV_CODEC_FLAG2_FAST;
+  if (avcodec_open2(vctx, vc, NULL) < 0) {
+    avcodec_free_context(&vctx); avformat_close_input(&fmt);
+    set_msg(TR("Неподдерживаемый видеокодек")); return;
+  }
+
+  AVCodecContext *actx = NULL;
+  struct SwrContext *swr = NULL;
+  int psp_ch = -1;
+  if (aidx >= 0) {
+    const AVCodec *ac = avcodec_find_decoder(fmt->streams[aidx]->codecpar->codec_id);
+    if (ac) {
+      actx = avcodec_alloc_context3(ac);
+      if (actx && avcodec_parameters_to_context(actx, fmt->streams[aidx]->codecpar) >= 0 &&
+          avcodec_open2(actx, ac, NULL) >= 0) {
+#if LIBSWRESAMPLE_VERSION_INT >= AV_VERSION_INT(4, 7, 0)
+        AVChannelLayout out_ch = AV_CHANNEL_LAYOUT_STEREO;
+        if (swr_alloc_set_opts2(&swr, &out_ch, AV_SAMPLE_FMT_S16, 44100,
+                                &actx->ch_layout, actx->sample_fmt, actx->sample_rate, 0, NULL) < 0)
+          swr = NULL;
+#else
+        int64_t in_ch = actx->channel_layout ? (int64_t)actx->channel_layout
+                                             : av_get_default_channel_layout(actx->channels);
+        swr = swr_alloc_set_opts(NULL, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, 44100,
+                                 in_ch, actx->sample_fmt, actx->sample_rate, 0, NULL);
+#endif
+        if (swr && swr_init(swr) >= 0) {
+          psp_ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, 1152, PSP_AUDIO_FORMAT_STEREO);
+          if (psp_ch < 0) swr_free(&swr);
+        } else if (swr) {
+          swr_free(&swr);
+        }
+      } else if (actx) {
+        avcodec_free_context(&actx);
+      }
+    }
+  }
+
+  AVPacket *pkt = av_packet_alloc();
+  AVFrame *frame = av_frame_alloc();
+  struct SwsContext *sws = NULL;
+  int sws_w = 0, sws_h = 0, sws_fmt = -1, dw = SW, dh = SH, ox = 0, oy = 0;
+
+  static short ff_abuf[1152 * 2] __attribute__((aligned(64)));
+  int afill = 0;
+  short *rbuf = NULL;
+  int rcap = 0;
+
+  AVRational vtb = fmt->streams[vidx]->time_base;
+  int dur_sec = fmt->duration > 0 ? (int)(fmt->duration / AV_TIME_BASE) : 0;
+  uint64_t t0 = 0;
+  int64_t pts0 = AV_NOPTS_VALUE;
+  int cur_sec = 0, paused = 0, show_hud = 1, quit = 0;
+
+  while (!quit && pkt && frame) {
+    unsigned p = read_pad();
+    if (p & PSP_CTRL_CIRCLE) break;
+    if (p & PSP_CTRL_SQUARE) { paused = !paused; pts0 = AV_NOPTS_VALUE; }
+    if (p & PSP_CTRL_TRIANGLE) show_hud = !show_hud;
+    if (p & PSP_CTRL_UP) vol_change(0x800);
+    if (p & PSP_CTRL_DOWN) vol_change(-0x800);
+    if (p & (PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER)) {
+      int64_t target_s = (int64_t)cur_sec + ((p & PSP_CTRL_RTRIGGER) ? 10 : -10);
+      if (target_s < 0) target_s = 0;
+      av_seek_frame(fmt, -1, target_s * AV_TIME_BASE, (p & PSP_CTRL_LTRIGGER) ? AVSEEK_FLAG_BACKWARD : 0);
+      avcodec_flush_buffers(vctx);
+      if (actx) avcodec_flush_buffers(actx);
+      pts0 = AV_NOPTS_VALUE; afill = 0;
+    }
+
+    if (paused) { sceDisplayWaitVblankStart(); continue; }
+    if (av_read_frame(fmt, pkt) < 0) break;
+
+    if (pkt->stream_index == vidx) {
+      if (avcodec_send_packet(vctx, pkt) == 0) {
+        while (avcodec_receive_frame(vctx, frame) == 0) {
+          if (!sws || frame->width != sws_w || frame->height != sws_h || frame->format != sws_fmt) {
+            if (sws) sws_freeContext(sws);
+            sws_w = frame->width; sws_h = frame->height; sws_fmt = frame->format;
+            if ((long)sws_w * SH > (long)sws_h * SW) { dw = SW; dh = sws_h * SW / sws_w; }
+            else { dh = SH; dw = sws_w * SH / sws_h; }
+            if (dw < 2) dw = 2;
+            if (dh < 2) dh = 2;
+            ox = (SW - dw) / 2; oy = (SH - dh) / 2;
+            sws = sws_getContext(sws_w, sws_h, (enum AVPixelFormat)sws_fmt,
+                                 dw, dh, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
+          }
+          if (!sws) continue;
+
+          int64_t pts = frame->best_effort_timestamp;
+          if (pts != AV_NOPTS_VALUE) {
+            int64_t pts_us = av_rescale_q(pts, vtb, (AVRational){ 1, 1000000 });
+            if (pts0 == AV_NOPTS_VALUE) { pts0 = pts_us; t0 = sceKernelGetSystemTimeWide(); }
+            int64_t target = (int64_t)t0 + (pts_us - pts0);
+            int64_t now = (int64_t)sceKernelGetSystemTimeWide();
+            if (target > now && target - now < 500000) sceKernelDelayThread((SceUInt)(target - now));
+            else if (now - target > 500000) { pts0 = pts_us; t0 = (uint64_t)now; }
+            cur_sec = (int)(pts_us / 1000000);
+          }
+
+          for (int i = 0; i < SW * SH; i++) fb[i] = C_BLACK;
+          uint8_t *dst[4] = { (uint8_t *)(fb + oy * SW + ox), NULL, NULL, NULL };
+          int dlns[4] = { SW * 4, 0, 0, 0 };
+          sws_scale(sws, (const uint8_t *const *)frame->data, frame->linesize, 0, sws_h, dst, dlns);
+
+          if (show_hud) {
+            char tb[48];
+            if (dur_sec > 0) snprintf(tb, sizeof tb, "%02d:%02d / %02d:%02d", cur_sec / 60, cur_sec % 60, dur_sec / 60, dur_sec % 60);
+            else snprintf(tb, sizeof tb, "%02d:%02d", cur_sec / 60, cur_sec % 60);
+            fill_rect(0, SH - 28, SW, 28, C_DARK, 175);
+            draw_text(&FONT_S, 10, SH - 25, C_WHITE, base(path), 330, 0);
+            draw_text_r(&FONT_S, SW - 10, SH - 25, C_GRAY, tb);
+            fill_rect(10, SH - 6, SW - 20, 3, C_WHITE, 50);
+            if (dur_sec > 0) {
+              int pw = (SW - 20) * (cur_sec > dur_sec ? dur_sec : cur_sec) / dur_sec;
+              fill_rect(10, SH - 6, pw, 3, C_ACC, 255);
+            }
+          }
+          flip(0);
+        }
+      }
+    } else if (pkt->stream_index == aidx && actx && swr && psp_ch >= 0) {
+      if (avcodec_send_packet(actx, pkt) == 0) {
+        while (avcodec_receive_frame(actx, frame) == 0) {
+          int out_n = (int)av_rescale_rnd(swr_get_delay(swr, actx->sample_rate) + frame->nb_samples,
+                                          44100, actx->sample_rate, AV_ROUND_UP);
+          if (out_n > rcap) {
+            short *nb = realloc(rbuf, (size_t)out_n * 4);
+            if (!nb) break;
+            rbuf = nb; rcap = out_n;
+          }
+          uint8_t *outp[1] = { (uint8_t *)rbuf };
+          int conv = swr_convert(swr, outp, out_n, (const uint8_t **)frame->extended_data, frame->nb_samples);
+          for (int i = 0; i < conv; i++) {
+            ff_abuf[afill * 2] = rbuf[i * 2];
+            ff_abuf[afill * 2 + 1] = rbuf[i * 2 + 1];
+            afill++;
+            if (afill == 1152) { sceAudioOutputBlocking(psp_ch, a_vol, ff_abuf); afill = 0; }
+          }
+        }
+      }
+    }
+    av_packet_unref(pkt);
+  }
+
+  if (rbuf) free(rbuf);
+  if (sws) sws_freeContext(sws);
+  if (swr) swr_free(&swr);
+  if (psp_ch >= 0) sceAudioChRelease(psp_ch);
+  if (frame) av_frame_free(&frame);
+  if (pkt) av_packet_free(&pkt);
+  if (actx) avcodec_free_context(&actx);
+  avcodec_free_context(&vctx);
+  avformat_close_input(&fmt);
+}
+#endif
+
+static void video_player(const char *path) {
+#ifdef HAVE_FFMPEG
+  video_player_ffmpeg(path);
+#else
+  video_player_avi(path);
+#endif
+}
+
 /* ================= UI rendering ================= */
 static const char *tabnames[5] = { N_("Главная"), N_("Память PSP"), N_("Поиск"), N_("Настройки"), N_("О приложении") };
 
@@ -1039,7 +1406,8 @@ static void draw_preview(Entry *e) {
   char b2[64]; snprintf(b2, sizeof b2, TR("Тип: %s"), type_upper(e->type));
   draw_text(&FONT_S, 320, y, C_ACC, b2, 146, 0); y += 18;
   char nb[64]; const char *note = NULL; int warn = 0;
-  if (e->type == T_VIDEO) { note = TR("Видео: скоро"); warn = 1; }
+  if (e->type == T_VIDEO && !is_video_playable(e->path)) { note = TR("Неподдерживаемый формат"); warn = 1; }
+  else if (e->type == T_VIDEO) { snprintf(nb, sizeof nb, TR("%s — смотреть"), KN(ACT_OK)); note = nb; }
   else if (e->type == T_AUDIO && !is_mp3(e->path)) { note = TR("Пока только MP3"); warn = 1; }
   else if (e->type == T_IMAGE && !is_viewable(e->path)) { note = TR("Пока JPG, PNG и BMP"); warn = 1; }
   else if (e->type == T_AUDIO) { snprintf(nb, sizeof nb, TR("%s — играть"), KN(ACT_OK)); note = nb; }
@@ -1144,7 +1512,7 @@ static void render_about(void) {
   draw_text(&FONT_L, 20, 38, C_TITLE, "PSP media  v1.1", 0, 1);
   char ln[10][120];
   snprintf(ln[0], 120, "%s", TR("Плеер для PSP: музыка, фото и видео с карты памяти."));
-  snprintf(ln[1], 120, "%s", TR("Сейчас: MP3, JPG, PNG. Видео — в следующей версии."));
+  snprintf(ln[1], 120, "%s", TR("Сейчас: MP3, JPG, PNG, BMP, MP4, AVI, MKV."));
   snprintf(ln[2], 120, TR("%s/%s — вкладки     %s — открыть     %s — назад"), KN(ACT_PREV), KN(ACT_NEXT), KN(ACT_OK), KN(ACT_BACK));
   snprintf(ln[3], 120, TR("%s — пауза     %s — стоп музыки     %s — доп. действие"), KN(ACT_PAUSE), KN(ACT_STOP), KN(ACT_ALT));
   snprintf(ln[4], 120, "%s", TR("Select + Вверх/Вниз — громкость, Влево/Вправо — трек"));
@@ -1352,7 +1720,10 @@ static void open_entry(View *v) {
     case T_IMAGE:
       if (is_viewable(e->path)) photo_viewer(v, v->cursor); else set_msg(TR("Поддерживаются JPG, PNG и BMP"));
       break;
-    case T_VIDEO: set_msg(TR("Воспроизведение видео будет в следующей версии")); break;
+    case T_VIDEO:
+      if (is_video_playable(e->path)) video_player(e->path);
+      else set_msg(TR("Формат видео не поддерживается"));
+      break;
     default: set_msg(TR("Этот тип файла не поддерживается"));
   }
 }
