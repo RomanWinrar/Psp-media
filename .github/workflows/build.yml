@@ -14,8 +14,52 @@ jobs:
       - name: Install libraries
         run: |
           psp-pacman -Sy --noconfirm libmad libpng zlib || true
-          psp-pacman -S --noconfirm libjpeg-turbo || psp-pacman -S --noconfirm libjpeg || true
-          psp-pacman -S --noconfirm ffmpeg || psp-pacman -S --noconfirm psp-ffmpeg || true
+
+      - name: Cache PSP FFmpeg
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: /tmp/psp-ffmpeg
+          key: psp-ffmpeg-6.1.2-v1
+
+      - name: Build minimal FFmpeg for PSP
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/ffbuild && cd /tmp/ffbuild
+          curl -L https://ffmpeg.org/releases/ffmpeg-6.1.2.tar.xz -o ffmpeg.tar.xz
+          tar xf ffmpeg.tar.xz
+          cd ffmpeg-6.1.2
+          ./configure \
+            --prefix=/tmp/psp-ffmpeg \
+            --enable-cross-compile \
+            --cross-prefix=psp- \
+            --arch=mips \
+            --target-os=none \
+            --disable-asm \
+            --disable-pthreads \
+            --disable-w32threads \
+            --disable-os2threads \
+            --disable-network \
+            --disable-programs \
+            --disable-doc \
+            --disable-debug \
+            --disable-avdevice \
+            --disable-avfilter \
+            --disable-everything \
+            --enable-small \
+            --enable-protocol=file \
+            --enable-demuxer=mov,matroska,avi \
+            --enable-parser=h264,mpeg4video,mjpeg,aac,mpegaudio \
+            --enable-decoder=h264,mpeg4,mjpeg,aac,mp3,mp3float,pcm_s16le \
+            --extra-cflags="-O2 -G0 -I/usr/local/pspdev/psp/include -I/usr/local/pspdev/psp/sdk/include" \
+            --extra-ldflags="-L/usr/local/pspdev/psp/lib -L/usr/local/pspdev/psp/sdk/lib"
+          make -j$(nproc)
+          make install
+
+      - name: Install cached FFmpeg into PSPDEV
+        run: |
+          cp -r /tmp/psp-ffmpeg/include/* /usr/local/pspdev/psp/include/
+          cp -r /tmp/psp-ffmpeg/lib/* /usr/local/pspdev/psp/lib/
 
       - name: Build
         run: make
