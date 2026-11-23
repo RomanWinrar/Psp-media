@@ -1123,11 +1123,18 @@ static void video_player_ffmpeg(const char *path) {
   splash(TR("Загрузка видео..."), base(path));
 
   AVFormatContext *fmt = NULL;
-  if (avformat_open_input(&fmt, path, NULL, NULL) < 0) {
-    set_msg(TR("Не удалось открыть видео")); return;
+  char ffurl[272];
+  snprintf(ffurl, sizeof ffurl, "file:%s", path);
+  int err = avformat_open_input(&fmt, ffurl, NULL, NULL);
+  if (err < 0) {
+    char m[96]; snprintf(m, sizeof m, "%s (%d)", TR("Не удалось открыть видео"), err);
+    set_msg(m); return;
   }
-  if (avformat_find_stream_info(fmt, NULL) < 0) {
-    avformat_close_input(&fmt); set_msg(TR("Не удалось открыть видео")); return;
+  err = avformat_find_stream_info(fmt, NULL);
+  if (err < 0) {
+    avformat_close_input(&fmt);
+    char m[96]; snprintf(m, sizeof m, "%s (%d)", TR("Не удалось открыть видео"), err);
+    set_msg(m); return;
   }
 
   int vidx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
