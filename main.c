@@ -1314,16 +1314,17 @@ static void draw_header(void) {
   fill_rect(0, 27, SW, 1, C_ACC, 110);
   draw_text(&FONT_L, 8, 1, C_TITLE, "PSP media", 0, 1);
   int nt = a_playing ? 6 : 5;
-  int tw[6], sum = 0, x0 = nt == 6 ? 98 : 104;
-  for (int i = 0; i < nt; i++) { tw[i] = text_width(&FONT_M, TR(tabnames[i])); sum += tw[i]; }
-  int gap = (SW - 6 - x0 - sum) / (nt - 1);
+  const Font *tf = (nt == 6) ? &FONT_S : &FONT_M;
+  int tw[6], sum = 0, x0 = 104;
+  for (int i = 0; i < nt; i++) { tw[i] = text_width(tf, TR(tabnames[i])); sum += tw[i]; }
+  int gap = (SW - 8 - x0 - sum) / (nt - 1);
   if (gap > 18) gap = 18;
-  if (gap < 3) gap = 3;
+  if (gap < 4) gap = 4;
   int x = x0;
   for (int i = 0; i < nt; i++) {
     int act = (i == g_tab);
     uint32_t col = act ? C_WHITE : (i == 5 ? C_GREEN : C_GRAY);
-    draw_text(&FONT_M, x, 5, col, TR(tabnames[i]), 0, 1);
+    draw_text(tf, x, 5, col, TR(tabnames[i]), 0, 1);
     if (act) fill_rect(x, 23, tw[i], 2, i == 5 ? C_GREEN : C_WHITE, 255);
     x += tw[i] + gap;
   }
