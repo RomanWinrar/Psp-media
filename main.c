@@ -1,5 +1,5 @@
-// PSP media v1.0 - media player with Miku-style UI
-// Tabs: Home (cards) / PSP memory (folders) / Search / About
+// PSP media v1.1 - media player with Miku-style UI and settings
+// Tabs: Home (cards) / PSP memory (folders) / Search / Settings / About
 // Audio: MP3 (libmad). Photos: JPG, PNG. Video: files are listed, playback comes later.
 #include <pspkernel.h>
 #include <pspdisplay.h>
@@ -18,8 +18,10 @@
 #include <mad.h>
 #include <jpeglib.h>
 #include <png.h>
+#include <time.h>
 #include "font.h"
 #include "assets.h"
+#include "lang.h"
 
 PSP_MODULE_INFO("PSPmedia", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
@@ -53,11 +55,111 @@ static int cnt[5];
 
 static uint32_t fb[SW * SH];
 static uint32_t *vram;
-static uint32_t *bgimg[2];
+static uint32_t *bgimg[3];   // 0 blue, 1 dark, 2 custom (from a photo)
 
 static int g_tab, g_sub, g_card, g_sfocus, g_ci, g_kind;
 static unsigned g_frames, held;
 static char msgbuf[96]; static int msgtimer;
+
+/* ================= settings, language, key mapping ================= */
+typedef struct {
+  uint32_t magic, ver;
+  uint8_t lang, bg, dim, rep, shuf, startvol, stick, sens, preview, cpu, hints, pad0;
+  uint32_t keymap[7];
+  char bgpath[256];
+} Cfg;
+#define CFG_MAGIC 0x504D4544u
+#define CFG_VER 1
+#define CFG_PATH "ms0:/PSP/PSPmedia.cfg"
+static Cfg cfg;
+enum { ACT_OK, ACT_BACK, ACT_PAUSE, ACT_STOP, ACT_PREV, ACT_NEXT, ACT_ALT, ACT_N };
+// logical action -> default physical button (the code below works with these "logical" bits)
+static const unsigned LOGICAL[ACT_N] = { PSP_CTRL_CROSS, PSP_CTRL_CIRCLE, PSP_CTRL_SQUARE, PSP_CTRL_START,
+                                         PSP_CTRL_LTRIGGER, PSP_CTRL_RTRIGGER, PSP_CTRL_TRIANGLE };
+static const int vol_steps[4] = { 25, 50, 75, 100 };
+
+#define N_(s) s   /* marks a string that is translated later, at the place where it is used */
+static const char *TR(const char *ru) {
+  if (cfg.lang == 0) return ru;
+  for (unsigned i = 0; i < sizeof tr_tab / sizeof tr_tab[0]; i++)
+    if (!strcmp(tr_tab[i][0], ru)) return tr_tab[i][1];
+  return ru;
+}
+static const char *btn_name(unsigned m) {
+  switch (m) {
+    case PSP_CTRL_CROSS: return "X";
+    case PSP_CTRL_CIRCLE: return "O";
+    case PSP_CTRL_SQUARE: return TR("Квадрат");
+    case PSP_CTRL_TRIANGLE: return TR("Треугольник");
+    case PSP_CTRL_START: return "Start";
+    case PSP_CTRL_LTRIGGER: return "L";
+    case PSP_CTRL_RTRIGGER: return "R";
+  }
+  return "?";
+}
+#define KN(a) btn_name(cfg.keymap[a])
+
+static void keys_default(void) { for (int a = 0; a < ACT_N; a++) cfg.keymap[a] = LOGICAL[a]; }
+static void keys_japan(void) { keys_default(); cfg.keymap[ACT_OK] = PSP_CTRL_CIRCLE; cfg.keymap[ACT_BACK] = PSP_CTRL_CROSS; }
+static int keys_preset(void) {
+  int def = 1, jp = 1;
+  for (int a = 0; a < ACT_N; a++) {
+    unsigned j = a == ACT_OK ? PSP_CTRL_CIRCLE : a == ACT_BACK ? PSP_CTRL_CROSS : LOGICAL[a];
+    if (cfg.keymap[a] != LOGICAL[a]) def = 0;
+    if (cfg.keymap[a] != j) jp = 0;
+  }
+  return def ? 0 : jp ? 1 : 2;
+}
+static int keymap_ok(const uint32_t *k) {
+  unsigned seen = 0;
+  for (int a = 0; a < ACT_N; a++) {
+    int found = 0;
+    for (int b = 0; b < ACT_N; b++) if (k[a] == LOGICAL[b]) found = 1;
+    if (!found || (seen & k[a])) return 0;
+    seen |= k[a];
+  }
+  return 1;
+}
+static void cfg_defaults(void) {
+  memset(&cfg, 0, sizeof cfg);
+  cfg.magic = CFG_MAGIC; cfg.ver = CFG_VER;
+  cfg.lang = 0; cfg.bg = 0; cfg.dim = 1; cfg.rep = 1; cfg.shuf = 0; cfg.startvol = 2;
+  cfg.stick = 1; cfg.sens = 1; cfg.preview = 1; cfg.cpu = 1; cfg.hints = 1;
+  keys_default();
+}
+static void cfg_save(void) {
+  FILE *f = fopen(CFG_PATH, "wb");
+  if (!f) return;
+  fwrite(&cfg, 1, sizeof cfg, f);
+  fclose(f);
+}
+static void cfg_load(void) {
+  cfg_defaults();
+  FILE *f = fopen(CFG_PATH, "rb");
+  if (!f) return;
+  Cfg t;
+  if (fread(&t, 1, sizeof t, f) == sizeof t && t.magic == CFG_MAGIC && t.ver == CFG_VER) {
+    t.bgpath[255] = 0;
+    if (t.lang > 1) t.lang = 0;
+    if (t.bg > 3) t.bg = 0;
+    if (t.dim > 2) t.dim = 1;
+    if (t.rep > 2) t.rep = 1;
+    if (t.shuf > 1) t.shuf = 0;
+    if (t.startvol > 3) t.startvol = 2;
+    if (t.stick > 1) t.stick = 1;
+    if (t.sens > 2) t.sens = 1;
+    if (t.preview > 1) t.preview = 1;
+    if (t.cpu > 1) t.cpu = 1;
+    if (t.hints > 1) t.hints = 1;
+    if (!keymap_ok(t.keymap)) for (int a = 0; a < ACT_N; a++) t.keymap[a] = LOGICAL[a];
+    cfg = t;
+  }
+  fclose(f);
+}
+static void apply_cpu(void) {
+  if (cfg.cpu) scePowerSetClockFrequency(333, 333, 166);
+  else scePowerSetClockFrequency(222, 222, 111);
+}
 
 /* ================= exit callback ================= */
 static int exit_cb(int a, int b, void *c) { sceKernelExitGame(); return 0; }
@@ -283,32 +385,40 @@ static void blit_fit(const uint32_t *src, int sw, int sh, int dx, int dy, int dw
 
 /* ================= input ================= */
 enum { ST_UP = 1, ST_DOWN = 2, ST_LEFT = 4, ST_RIGHT = 8 };
-static unsigned stick_ev;   // analog stick "key presses" with auto-repeat (faster when pushed further)
-static unsigned axis_event(int d, int *cnt, unsigned bit) {
-  const int dead = 45;
+static unsigned stick_ev;    // analog stick "key presses" with auto-repeat (faster when pushed further)
+static unsigned raw_press;   // physical buttons pressed this frame (before remapping)
+static unsigned axis_event(int d, int *cnt, unsigned bit, int dead) {
   if (d <= dead) { *cnt = 0; return 0; }
-  int mag = d - dead;
-  if (mag > 82) mag = 82;
+  int range = 127 - dead, mag = d - dead;
+  if (mag > range) mag = range;
   int c = (*cnt)++;
   if (c == 0) return bit;
   if (c < 14) return 0;
-  int interval = 8 - mag * 6 / 82;
+  int interval = 8 - mag * 6 / range;
   return ((c - 14) % interval == 0) ? bit : 0;
 }
 static unsigned read_pad(void) {
   static unsigned old; static int hold; static int sc[4];
+  static const int dz[3] = { 70, 45, 28 };
   SceCtrlData pad; sceCtrlPeekBufferPositive(&pad, 1);
-  int dx = (int)pad.Lx - 128, dy = (int)pad.Ly - 128;
-  stick_ev = axis_event(-dy, &sc[0], ST_UP) | axis_event(dy, &sc[1], ST_DOWN) |
-             axis_event(-dx, &sc[2], ST_LEFT) | axis_event(dx, &sc[3], ST_RIGHT);
+  if (cfg.stick) {
+    int dx = (int)pad.Lx - 128, dy = (int)pad.Ly - 128, dd = dz[cfg.sens > 2 ? 1 : cfg.sens];
+    stick_ev = axis_event(-dy, &sc[0], ST_UP, dd) | axis_event(dy, &sc[1], ST_DOWN, dd) |
+               axis_event(-dx, &sc[2], ST_LEFT, dd) | axis_event(dx, &sc[3], ST_RIGHT, dd);
+  } else { stick_ev = 0; sc[0] = sc[1] = sc[2] = sc[3] = 0; }
   unsigned b = pad.Buttons, n = b & ~old;
   unsigned dp = PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_LEFT | PSP_CTRL_RIGHT;
   if (b & dp) {
     if (n & dp) hold = 0;
     else { hold++; if (hold > 20 && hold % 3 == 0) n |= b & dp; }
   } else hold = 0;
-  old = b; held = b;
-  return n;
+  old = b; held = b; raw_press = n;
+  // remap: physical button -> logical action bit (the rest of the program only sees logical bits)
+  unsigned mask = 0;
+  for (int a = 0; a < ACT_N; a++) mask |= LOGICAL[a];
+  unsigned lp = n & ~mask;
+  for (int a = 0; a < ACT_N; a++) if (n & cfg.keymap[a]) lp |= LOGICAL[a];
+  return lp;
 }
 static void set_msg(const char *m) { strncpy(msgbuf, m, 95); msgbuf[95] = 0; msgtimer = 150; }
 
@@ -343,11 +453,11 @@ static int is_jpeg(const char *p) { return has_ext(p, "jpg,jpeg"); }
 static int is_viewable(const char *p) { return has_ext(p, "jpg,jpeg,png"); }
 static const char *base(const char *p) { const char *s = strrchr(p, '/'); return s ? s + 1 : p; }
 static const char *type_upper(int t) {
-  return t == T_DIR ? "ПАПКА" : t == T_AUDIO ? "МУЗЫКА" : t == T_VIDEO ? "ВИДЕО" : t == T_IMAGE ? "ФОТО" : "ФАЙЛ";
+  return t == T_DIR ? TR("ПАПКА") : t == T_AUDIO ? TR("МУЗЫКА") : t == T_VIDEO ? TR("ВИДЕО") : t == T_IMAGE ? TR("ФОТО") : TR("ФАЙЛ");
 }
 static void fmt_size(char *o, uint32_t b) {
-  if (b < 1024 * 1024) snprintf(o, 24, "%u КБ", (unsigned)((b + 1023) / 1024));
-  else snprintf(o, 24, "%u.%u МБ", (unsigned)(b / 1048576), (unsigned)((b % 1048576) * 10 / 1048576));
+  if (b < 1024 * 1024) snprintf(o, 24, TR("%u КБ"), (unsigned)((b + 1023) / 1024));
+  else snprintf(o, 24, TR("%u.%u МБ"), (unsigned)(b / 1048576), (unsigned)((b % 1048576) * 10 / 1048576));
 }
 
 /* ================= scanning ================= */
@@ -382,8 +492,8 @@ static void scan_dir(const char *dir, int depth) {
   SceUID fd = sceIoDopen(dir);
   if (fd < 0) return;
   if ((tick++ & 7) == 0) {
-    char b[48]; snprintf(b, sizeof b, "Найдено файлов: %d", nall);
-    splash("Сканирую карту памяти...", b);
+    char b[48]; snprintf(b, sizeof b, TR("Найдено файлов: %d"), nall);
+    splash(TR("Сканирую карту памяти..."), b);
   }
   SceIoDirent d;
   while (nall < MAX_ALL) {
@@ -412,7 +522,7 @@ static int pcmp(const void *a, const void *b) {
 static void scan_all(void) {
   nall = 0;
   alias_psp = dir_exists("ms0:/GAME") && dir_exists("ms0:/PSP/GAME");
-  splash("Сканирую карту памяти...", "");
+  splash(TR("Сканирую карту памяти..."), "");
   scan_dir("ms0:/", 0);
   qsort(all, nall, sizeof(Entry), pcmp);
   memset(cnt, 0, sizeof cnt);
@@ -626,8 +736,16 @@ static void start_queue(View *v) {
 }
 static void next_track(int dir) {
   if (nq == 0) return;
-  qpos = (qpos + dir + nq) % nq;
+  if (cfg.shuf && nq > 1) { int r; do r = rand() % nq; while (r == qpos); qpos = r; }
+  else qpos = (qpos + dir + nq) % nq;
   play_path(qpath[qpos]);
+}
+static void on_track_finished(void) {   // called when a track ended by itself
+  fail_run = 0;
+  if (nq == 0) return;
+  if (cfg.rep == 2) { play_path(qpath[qpos]); return; }                   // repeat one
+  if (cfg.rep == 0 && !cfg.shuf && qpos == nq - 1) return;                // repeat off: stop after the last
+  next_track(1);
 }
 static void vol_change(int d) {
   int v = a_vol + d;
@@ -754,22 +872,24 @@ static void photo_viewer(View *v, int pos) {
     Entry *e = v->it[pos];
     if (reload) {
       if (im) free(im);
-      splash("Загрузка фото...", e->disp);
+      splash(TR("Загрузка фото..."), e->disp);
       im = load_photo(e->path, &w, &h); reload = 0;
     }
     for (int i = 0; i < SW * SH; i++) fb[i] = C_BLACK;
     if (im) blit_fit(im, w, h, 0, 0, SW, SH);
-    else draw_text(&FONT_M, 90, 120, C_YELLOW, "Не удалось открыть (слишком большое или битое)", 0, 1);
+    else draw_text(&FONT_M, 90, 120, C_YELLOW, TR("Не удалось открыть (слишком большое или битое)"), 0, 1);
     if (show) {
       char b[32]; snprintf(b, sizeof b, "%d / %d", pos + 1, v->n);
       fill_rect(0, SH - 40, SW, 40, C_DARK, 175);
       draw_text(&FONT_M, 10, SH - 37, C_WHITE, e->disp, 380, 0);
       draw_text_r(&FONT_S, SW - 10, SH - 36, C_GRAY, b);
-      draw_text(&FONT_S, 10, SH - 19, C_GRAY, "L/R — листать   Треугольник — скрыть подпись   O — назад", 0, 0);
+      char hb[128];
+      snprintf(hb, sizeof hb, TR("%s/%s — листать   %s — скрыть подпись   %s — назад"), KN(ACT_PREV), KN(ACT_NEXT), KN(ACT_ALT), KN(ACT_BACK));
+      draw_text(&FONT_S, 10, SH - 19, C_GRAY, hb, 0, 0);
     }
     flip(1);
     unsigned p = read_pad();
-    if (a_finished) { a_finished = 0; fail_run = 0; next_track(1); }
+    if (a_finished) { a_finished = 0; on_track_finished(); }
     if (stick_ev & ST_RIGHT) p |= PSP_CTRL_RTRIGGER;
     if (stick_ev & ST_LEFT) p |= PSP_CTRL_LTRIGGER;
     if (p & PSP_CTRL_CIRCLE) break;
@@ -781,18 +901,23 @@ static void photo_viewer(View *v, int pos) {
 }
 
 /* ================= UI rendering ================= */
-static const char *tabnames[4] = { "Главная", "Память PSP", "Поиск", "О приложении" };
+static const char *tabnames[5] = { N_("Главная"), N_("Память PSP"), N_("Поиск"), N_("Настройки"), N_("О приложении") };
 
 static void draw_header(void) {
   fill_rect(0, 0, SW, 27, C_DARK, 155);
   fill_rect(0, 27, SW, 1, C_ACC, 110);
   draw_text(&FONT_L, 8, 1, C_TITLE, "PSP media", 0, 1);
-  int x = 112;
-  for (int i = 0; i < 4; i++) {
-    int w = text_width(&FONT_M, tabnames[i]), act = (i == g_tab);
-    draw_text(&FONT_M, x, 5, act ? C_WHITE : C_GRAY, tabnames[i], 0, 1);
-    if (act) fill_rect(x, 23, w, 2, C_WHITE, 255);
-    x += w + 18;
+  int tw[5], sum = 0, x0 = 104;
+  for (int i = 0; i < 5; i++) { tw[i] = text_width(&FONT_M, TR(tabnames[i])); sum += tw[i]; }
+  int gap = (SW - 6 - x0 - sum) / 4;
+  if (gap > 18) gap = 18;
+  if (gap < 4) gap = 4;
+  int x = x0;
+  for (int i = 0; i < 5; i++) {
+    int act = (i == g_tab);
+    draw_text(&FONT_M, x, 5, act ? C_WHITE : C_GRAY, TR(tabnames[i]), 0, 1);
+    if (act) fill_rect(x, 23, tw[i], 2, C_WHITE, 255);
+    x += tw[i] + gap;
   }
 }
 
@@ -807,7 +932,7 @@ static void draw_bar(const char *hint) {
     int s = a_secs, d = a_dur;
     if (d > 0) snprintf(t, sizeof t, "%02d:%02d / %02d:%02d", s / 60, s % 60, d / 60, d % 60);
     else snprintf(t, sizeof t, "%02d:%02d", s / 60, s % 60);
-    snprintf(v, sizeof v, "Громк. %d%%", a_vol * 100 / 0x8000);
+    snprintf(v, sizeof v, TR("Громк. %d%%"), a_vol * 100 / 0x8000);
     draw_text_r(&FONT_S, SW - 10, 245, C_GRAY, t);
     draw_text_r(&FONT_S, SW - 100, 245, C_GRAY, v);
     fill_rect(10, 264, SW - 20, 3, C_WHITE, 50);
@@ -815,7 +940,7 @@ static void draw_bar(const char *hint) {
       int w = (SW - 20) * (s > d ? d : s) / d;
       fill_rect(10, 264, w, 3, C_ACC, 255);
     }
-  } else {
+  } else if (cfg.hints) {
     draw_text(&FONT_S, 10, 249, C_GRAY, hint, SW - 20, 0);
   }
 }
@@ -870,18 +995,18 @@ static void draw_preview(Entry *e) {
   int y = 126 + ln * FONT_S.lineh + 4;
   if (e->type != T_DIR) {
     char sz[24], b[64]; fmt_size(sz, e->size);
-    snprintf(b, sizeof b, "Размер: %s", sz); draw_text(&FONT_S, 320, y, C_GRAY, b, 146, 0); y += 16;
+    snprintf(b, sizeof b, TR("Размер: %s"), sz); draw_text(&FONT_S, 320, y, C_GRAY, b, 146, 0); y += 16;
   }
-  char b2[64]; snprintf(b2, sizeof b2, "Тип: %s", type_upper(e->type));
+  char b2[64]; snprintf(b2, sizeof b2, TR("Тип: %s"), type_upper(e->type));
   draw_text(&FONT_S, 320, y, C_ACC, b2, 146, 0); y += 18;
-  const char *note = NULL;
-  if (e->type == T_VIDEO) note = "Видео: скоро";
-  else if (e->type == T_AUDIO && !is_mp3(e->path)) note = "Пока только MP3";
-  else if (e->type == T_IMAGE && !is_viewable(e->path)) note = "Пока JPG и PNG";
-  else if (e->type == T_AUDIO) note = "X — играть";
-  else if (e->type == T_IMAGE) note = "X — открыть";
-  else if (e->type == T_DIR) note = "X — войти";
-  if (note) draw_text(&FONT_S, 320, y, (e->type == T_VIDEO || !strncmp(note, "Пока", 4)) ? C_YELLOW : C_GREEN, note, 146, 0);
+  char nb[64]; const char *note = NULL; int warn = 0;
+  if (e->type == T_VIDEO) { note = TR("Видео: скоро"); warn = 1; }
+  else if (e->type == T_AUDIO && !is_mp3(e->path)) { note = TR("Пока только MP3"); warn = 1; }
+  else if (e->type == T_IMAGE && !is_viewable(e->path)) { note = TR("Пока JPG и PNG"); warn = 1; }
+  else if (e->type == T_AUDIO) { snprintf(nb, sizeof nb, TR("%s — играть"), KN(ACT_OK)); note = nb; }
+  else if (e->type == T_IMAGE) { snprintf(nb, sizeof nb, TR("%s — открыть"), KN(ACT_OK)); note = nb; }
+  else if (e->type == T_DIR) { snprintf(nb, sizeof nb, TR("%s — войти"), KN(ACT_OK)); note = nb; }
+  if (note) draw_text(&FONT_S, 320, y, warn ? C_YELLOW : C_GREEN, note, 146, 0);
 }
 
 static void render_list(View *v, const char *title) {
@@ -890,7 +1015,7 @@ static void render_list(View *v, const char *title) {
   char b[32]; snprintf(b, sizeof b, "%d / %d", v->n ? v->cursor + 1 : 0, v->n);
   draw_text_r(&FONT_S, 296, 37, C_GRAY, b);
   fill_rect(8, 52, 300, 1, C_ACC, 70);
-  if (v->n == 0) draw_text(&FONT_S, 20, 64, C_GRAY, "Здесь пока пусто", 0, 0);
+  if (v->n == 0) draw_text(&FONT_S, 20, 64, C_GRAY, TR("Здесь пока пусто"), 0, 0);
   draw_rows(v, 8, 54, 300, ROWS_L, 1);
   draw_preview(v->n ? v->it[v->cursor] : NULL);
 }
@@ -925,19 +1050,19 @@ static void render_home(void) {
       char sz[24], b[48]; fmt_size(sz, first->size);
       draw_text(&FONT_M, x + 8, 120, C_WHITE, first->disp, 130, 1);
       draw_text(&FONT_S, x + 8, 139, C_GRAY, sz, 0, 0);
-      snprintf(b, sizeof b, "всего: %d", cnt[t]);
+      snprintf(b, sizeof b, TR("всего: %d"), cnt[t]);
       draw_text_r(&FONT_S, x + 138, 139, C_GRAY, b);
-    } else draw_text(&FONT_M, x + 8, 120, C_GRAY, "Нет файлов", 0, 1);
-    char tb[48]; snprintf(tb, sizeof tb, "ТИП: %s", type_upper(t));
+    } else draw_text(&FONT_M, x + 8, 120, C_GRAY, TR("Нет файлов"), 0, 1);
+    char tb[48]; snprintf(tb, sizeof tb, TR("ТИП: %s"), type_upper(t));
     draw_text(&FONT_S, x + 8, 156, sel ? C_ACC : C_GRAY, tb, 130, 0);
   }
   fill_rect(10, 184, 454, 52, C_DARK, 135);
   char b[96];
-  snprintf(b, sizeof b, "Найдено файлов: %d", cnt[T_AUDIO] + cnt[T_VIDEO] + cnt[T_IMAGE]);
+  snprintf(b, sizeof b, TR("Найдено файлов: %d"), cnt[T_AUDIO] + cnt[T_VIDEO] + cnt[T_IMAGE]);
   draw_text(&FONT_M, 20, 190, C_TITLE, b, 430, 1);
-  if (nall >= MAX_ALL) draw_text(&FONT_S, 20, 212, C_YELLOW, "Лимит списка достигнут, используй вкладку «Память PSP»", 430, 0);
+  if (nall >= MAX_ALL) draw_text(&FONT_S, 20, 212, C_YELLOW, TR("Лимит списка достигнут, используй вкладку «Память PSP»"), 430, 0);
   else {
-    snprintf(b, sizeof b, "Музыка: %d    Видео: %d    Фото: %d", cnt[T_AUDIO], cnt[T_VIDEO], cnt[T_IMAGE]);
+    snprintf(b, sizeof b, TR("Музыка: %d    Видео: %d    Фото: %d"), cnt[T_AUDIO], cnt[T_VIDEO], cnt[T_IMAGE]);
     draw_text(&FONT_S, 20, 212, C_WHITE, b, 430, 0);
   }
 }
@@ -946,7 +1071,7 @@ static void render_home(void) {
 static void render_search(void) {
   fill_rect(10, 34, 460, 26, C_DARK, 155);
   rect_border(10, 34, 460, 26, g_sfocus == 0 ? C_ACC : C_GRAY, g_sfocus == 0 ? 255 : 90, 1);
-  if (qn == 0) draw_text(&FONT_M, 18, 38, C_GRAY, "Введите название файла…", 0, 0);
+  if (qn == 0) draw_text(&FONT_M, 18, 38, C_GRAY, TR("Введите название файла…"), 0, 0);
   else {
     int w = draw_text(&FONT_M, 18, 38, C_WHITE, qstr, 440, 0);
     if (g_sfocus == 0 && (g_frames / 30) % 2 == 0) fill_rect(18 + w + 2, 38, 2, 16, C_ACC, 255);
@@ -967,8 +1092,8 @@ static void render_search(void) {
   }
   fill_rect(10, 94, 460, 142, C_DARK, 150);
   char b[64];
-  if (qn == 0) snprintf(b, sizeof b, "Результаты появятся здесь");
-  else snprintf(b, sizeof b, "Найдено: %d", vsrch.n);
+  if (qn == 0) snprintf(b, sizeof b, TR("Результаты появятся здесь"));
+  else snprintf(b, sizeof b, TR("Найдено: %d"), vsrch.n);
   draw_text(&FONT_S, 18, 97, C_ACC, b, 0, 0);
   fill_rect(10, 113, 460, 1, C_ACC, 60);
   draw_rows(&vsrch, 10, 115, 460, ROWS_S, g_sfocus == 1);
@@ -977,20 +1102,151 @@ static void render_search(void) {
 /* ---- about ---- */
 static void render_about(void) {
   fill_rect(10, 34, 460, 202, C_DARK, 155);
-  draw_text(&FONT_L, 20, 38, C_TITLE, "PSP media  v1.0", 0, 1);
-  static const char *lines[] = {
-    "Плеер для PSP: музыка, фото и видео с карты памяти.",
-    "Сейчас: MP3, JPG, PNG. Видео — в следующей версии.",
-    "L / R — вкладки     X — открыть     O — назад",
-    "Квадрат — пауза     Start — стоп музыки",
-    "Select + Вверх/Вниз — громкость",
-    "Select + Влево/Вправо — прошлый/следующий трек",
-    "Стик вверх/вниз — прокрутка (сильнее наклон — быстрее)",
-    "Стик влево/вправо: в списках — громкость, на главной —",
-    "карточки, в фото — листать, в поиске — выбор буквы",
-    "Фото: Треугольник — скрыть подпись   Поиск: Квадрат — стереть",
-  };
-  for (int i = 0; i < 10; i++) draw_text(&FONT_S, 20, 68 + i * 16, i < 2 ? C_WHITE : C_GRAY, lines[i], 440, 0);
+  draw_text(&FONT_L, 20, 38, C_TITLE, "PSP media  v1.1", 0, 1);
+  char ln[10][120];
+  snprintf(ln[0], 120, "%s", TR("Плеер для PSP: музыка, фото и видео с карты памяти."));
+  snprintf(ln[1], 120, "%s", TR("Сейчас: MP3, JPG, PNG. Видео — в следующей версии."));
+  snprintf(ln[2], 120, TR("%s/%s — вкладки     %s — открыть     %s — назад"), KN(ACT_PREV), KN(ACT_NEXT), KN(ACT_OK), KN(ACT_BACK));
+  snprintf(ln[3], 120, TR("%s — пауза     %s — стоп музыки     %s — доп. действие"), KN(ACT_PAUSE), KN(ACT_STOP), KN(ACT_ALT));
+  snprintf(ln[4], 120, "%s", TR("Select + Вверх/Вниз — громкость, Влево/Вправо — трек"));
+  snprintf(ln[5], 120, "%s", TR("Стик вверх/вниз — прокрутка (сильнее наклон — быстрее)"));
+  snprintf(ln[6], 120, "%s", TR("Стик влево/вправо: в списках — громкость, на главной —"));
+  snprintf(ln[7], 120, "%s", TR("карточки, в фото — листать, в поиске — выбор буквы"));
+  snprintf(ln[8], 120, "%s", TR("Кнопки перепутались? Держи Select + Start 2 секунды."));
+  snprintf(ln[9], 120, "%s", TR("Фон, язык и кнопки меняются во вкладке «Настройки»."));
+  for (int i = 0; i < 10; i++) draw_text(&FONT_S, 20, 68 + i * 16, i < 2 ? C_WHITE : (i >= 8 ? C_ACC : C_GRAY), ln[i], 440, 0);
+}
+
+/* ---- custom background ---- */
+static int load_custom_bg(const char *path) {
+  int w, h;
+  uint32_t *im = load_photo(path, &w, &h);
+  if (!im) return 0;
+  if (!bgimg[2]) bgimg[2] = malloc(SW * SH * 4);
+  if (!bgimg[2]) { free(im); return 0; }
+  float sx = SW / (float)w, sy = SH / (float)h, sc = sx > sy ? sx : sy;   // "cover": fill the screen, crop the rest
+  float ox = (w - SW / sc) / 2, oy = (h - SH / sc) / 2;
+  static int xm[SW];
+  for (int x = 0; x < SW; x++) { int v = (int)(ox + x / sc); xm[x] = v < 0 ? 0 : v >= w ? w - 1 : v; }
+  for (int y = 0; y < SH; y++) {
+    int v = (int)(oy + y / sc); if (v < 0) v = 0; if (v >= h) v = h - 1;
+    const uint32_t *src = im + (size_t)v * w;
+    for (int x = 0; x < SW; x++) bgimg[2][y * SW + x] = src[xm[x]] | 0xFF000000u;
+  }
+  free(im);
+  return 1;
+}
+
+/* ---- settings screen ---- */
+enum { SK_CHOICE, SK_ACTION, SK_KEY, SK_PRESET };
+enum { AC_PICKBG, AC_RESCAN, AC_RESET };
+typedef struct { const char *label; uint8_t *val; int nopt; const char *opt[4]; int kind; int arg; } SItem;
+static const SItem sitems[] = {
+  { N_("Язык"), &cfg.lang, 2, { N_("Русский"), N_("English") }, SK_CHOICE, 0 },
+  { N_("Фон"), &cfg.bg, 4, { N_("Авто"), N_("Синий"), N_("Тёмный"), N_("Свой") }, SK_CHOICE, 0 },
+  { N_("Свой фон (выбрать фото)"), NULL, 0, { NULL }, SK_ACTION, AC_PICKBG },
+  { N_("Затемнение фона"), &cfg.dim, 3, { N_("Мало"), N_("Средне"), N_("Сильно") }, SK_CHOICE, 0 },
+  { N_("Повтор"), &cfg.rep, 3, { N_("Выкл"), N_("Все"), N_("Один трек") }, SK_CHOICE, 0 },
+  { N_("Перемешивание"), &cfg.shuf, 2, { N_("Выкл"), N_("Вкл") }, SK_CHOICE, 0 },
+  { N_("Громкость при запуске"), &cfg.startvol, 4, { "25%", "50%", "75%", "100%" }, SK_CHOICE, 0 },
+  { N_("Аналоговый стик"), &cfg.stick, 2, { N_("Выкл"), N_("Вкл") }, SK_CHOICE, 0 },
+  { N_("Чувствительность стика"), &cfg.sens, 3, { N_("Низкая"), N_("Средняя"), N_("Высокая") }, SK_CHOICE, 0 },
+  { N_("Превью фото в списках"), &cfg.preview, 2, { N_("Выкл"), N_("Вкл") }, SK_CHOICE, 0 },
+  { N_("Подсказки внизу"), &cfg.hints, 2, { N_("Выкл"), N_("Вкл") }, SK_CHOICE, 0 },
+  { N_("Частота процессора"), &cfg.cpu, 2, { "222 MHz", "333 MHz" }, SK_CHOICE, 0 },
+  { N_("Раскладка кнопок"), NULL, 0, { NULL }, SK_PRESET, 0 },
+  { N_("Кнопка: ОК"), NULL, 0, { NULL }, SK_KEY, ACT_OK },
+  { N_("Кнопка: Назад"), NULL, 0, { NULL }, SK_KEY, ACT_BACK },
+  { N_("Кнопка: Пауза"), NULL, 0, { NULL }, SK_KEY, ACT_PAUSE },
+  { N_("Кнопка: Стоп музыки"), NULL, 0, { NULL }, SK_KEY, ACT_STOP },
+  { N_("Кнопка: Вкладка влево"), NULL, 0, { NULL }, SK_KEY, ACT_PREV },
+  { N_("Кнопка: Вкладка вправо"), NULL, 0, { NULL }, SK_KEY, ACT_NEXT },
+  { N_("Кнопка: Доп. действие"), NULL, 0, { NULL }, SK_KEY, ACT_ALT },
+  { N_("Пересканировать карту памяти"), NULL, 0, { NULL }, SK_ACTION, AC_RESCAN },
+  { N_("Сбросить все настройки"), NULL, 0, { NULL }, SK_ACTION, AC_RESET },
+};
+#define NSITEMS ((int)(sizeof sitems / sizeof sitems[0]))
+#define ROWS_SET 8
+static int g_set_sel, g_set_top, g_capture;   // g_capture = action being rebound + 1
+
+static void render_settings(void) {
+  fill_rect(10, 34, 460, 202, C_DARK, 155);
+  draw_text(&FONT_M, 20, 37, C_ACC, TR("Настройки"), 200, 1);
+  fill_rect(10, 56, 460, 1, C_ACC, 70);
+  for (int r = 0; r < ROWS_SET; r++) {
+    int i = g_set_top + r;
+    if (i >= NSITEMS) break;
+    const SItem *it = &sitems[i];
+    int ry = 58 + r * 22, sel = (i == g_set_sel);
+    if (sel) fill_rect(12, ry, 446, 21, C_ACC, 95);
+    draw_text(&FONT_S, 22, ry + 3, it->kind == SK_ACTION ? C_TITLE : C_WHITE, TR(it->label), 260, 0);
+    char vb[128]; vb[0] = 0; uint32_t vc = sel ? C_WHITE : C_GRAY;
+    switch (it->kind) {
+      case SK_CHOICE: snprintf(vb, sizeof vb, "< %s >", TR(it->opt[*it->val])); break;
+      case SK_PRESET: {
+        int pr = keys_preset();
+        snprintf(vb, sizeof vb, "< %s >", TR(pr == 0 ? N_("Стандартные") : pr == 1 ? N_("Японские (O — ОК)") : N_("Свои")));
+        break;
+      }
+      case SK_KEY:
+        if (g_capture == it->arg + 1) { snprintf(vb, sizeof vb, "%s", TR("нажмите кнопку…")); vc = C_YELLOW; }
+        else { snprintf(vb, sizeof vb, "%s", btn_name(cfg.keymap[it->arg])); vc = C_GREEN; }
+        break;
+      case SK_ACTION:
+        if (it->arg == AC_PICKBG) snprintf(vb, sizeof vb, "%s", cfg.bgpath[0] ? base(cfg.bgpath) : TR("не выбрано"));
+        else snprintf(vb, sizeof vb, ">");
+        break;
+    }
+    int w = text_width(&FONT_S, vb);
+    if (w > 190) w = 190;
+    draw_text(&FONT_S, 450 - w, ry + 3, vc, vb, 190, 0);
+  }
+  if (NSITEMS > ROWS_SET) {
+    int th = ROWS_SET * 22, bh = th * ROWS_SET / NSITEMS;
+    if (bh < 8) bh = 8;
+    int by = (th - bh) * g_set_top / (NSITEMS - ROWS_SET);
+    fill_rect(462, 58, 3, th, C_WHITE, 40);
+    fill_rect(462, 58 + by, 3, bh, C_ACC, 255);
+  }
+}
+
+static void rescan_all(void) {
+  scan_all(); load_dir(curdir); home_thumb_load();
+  set_msg(TR("Карта памяти пересканирована"));
+}
+static void settings_apply(const SItem *it) {
+  if (it->val == &cfg.cpu) apply_cpu();
+  if (it->val == &cfg.startvol) a_vol = vol_steps[cfg.startvol] * 0x8000 / 100;
+  if (it->val == &cfg.bg && cfg.bg == 3 && !bgimg[2]) {
+    if (!(cfg.bgpath[0] && load_custom_bg(cfg.bgpath))) { cfg.bg = 0; set_msg(TR("Сначала выберите свой фон")); }
+  }
+  cfg_save();
+}
+static void set_change(int i, int dir) {
+  const SItem *it = &sitems[i];
+  if (it->kind == SK_CHOICE) { *it->val = (*it->val + dir + it->nopt) % it->nopt; settings_apply(it); }
+  else if (it->kind == SK_PRESET) { if (keys_preset() == 0) keys_japan(); else keys_default(); cfg_save(); }
+}
+static void set_activate(int i) {
+  const SItem *it = &sitems[i];
+  if (it->kind == SK_CHOICE || it->kind == SK_PRESET) { set_change(i, 1); return; }
+  if (it->kind == SK_KEY) { g_capture = it->arg + 1; return; }
+  if (it->arg == AC_PICKBG) {
+    build_cat(T_IMAGE);
+    if (vcat.n == 0) set_msg(TR("Фото не найдены")); else g_sub = 1;
+  } else if (it->arg == AC_RESCAN) rescan_all();
+  else if (it->arg == AC_RESET) {
+    cfg_defaults(); apply_cpu();
+    a_vol = vol_steps[cfg.startvol] * 0x8000 / 100;
+    if (bgimg[2]) { free(bgimg[2]); bgimg[2] = NULL; }
+    cfg_save(); set_msg(TR("Настройки сброшены"));
+  }
+}
+static void pick_bg(const char *path) {
+  if (load_custom_bg(path)) {
+    strncpy(cfg.bgpath, path, 255); cfg.bgpath[255] = 0;
+    cfg.bg = 3; cfg_save(); g_sub = 0; set_msg(TR("Фон установлен"));
+  } else set_msg(TR("Не удалось загрузить фото"));
 }
 
 static Entry *cur_entry(void) {
@@ -998,26 +1254,47 @@ static Entry *cur_entry(void) {
   if (g_tab == 0 && g_sub == 1) v = &vcat;
   else if (g_tab == 1) v = &vmem;
   else if (g_tab == 2 && g_sfocus == 1) v = &vsrch;
+  else if (g_tab == 3 && g_sub == 1) v = &vcat;
   return (v && v->n) ? v->it[v->cursor] : NULL;
 }
 
+static uint32_t *current_bg(void) {
+  if (cfg.bg == 3 && bgimg[2]) return bgimg[2];
+  if (cfg.bg == 1) return bgimg[0];
+  if (cfg.bg == 2) return bgimg[1];
+  return bgimg[g_tab == 0 ? 0 : 1];   // auto: blue on Home, dark elsewhere
+}
+
 static void render(void) {
-  memcpy(fb, bgimg[g_tab == 0 ? 0 : 1], sizeof fb);
-  if (g_tab == 0) fill_hgrad(0, 0, 330, SH, C_DARK, 120, 0);
-  else fill_rect(0, 0, SW, SH, C_DARK, 85);
+  static const int dim[3] = { 45, 85, 130 };
+  memcpy(fb, current_bg(), sizeof fb);
+  int da = dim[cfg.dim > 2 ? 1 : cfg.dim];
+  if (g_tab == 0) fill_hgrad(0, 0, 330, SH, C_DARK, da + 35, 0);
+  else fill_rect(0, 0, SW, SH, C_DARK, da);
   draw_header();
-  const char *hint = "X открыть   O назад   L/R вкладки   Квадрат пауза   Start стоп";
+  char hint[200];
+  snprintf(hint, sizeof hint, TR("%s открыть   %s назад   %s/%s вкладки   %s пауза   %s стоп"),
+           KN(ACT_OK), KN(ACT_BACK), KN(ACT_PREV), KN(ACT_NEXT), KN(ACT_PAUSE), KN(ACT_STOP));
   if (g_tab == 0) {
     if (g_sub == 0) render_home();
     else {
-      static const char *names[3] = { "Видео", "Фото", "Музыка" };
-      render_list(&vcat, names[g_kind]);
+      static const char *names[3] = { N_("Видео"), N_("Фото"), N_("Музыка") };
+      render_list(&vcat, TR(names[g_kind]));
     }
   } else if (g_tab == 1) {
     render_list(&vmem, curdir);
   } else if (g_tab == 2) {
     render_search();
-    hint = "Лево/Право буква   X добавить   Квадрат стереть   Вниз результаты";
+    snprintf(hint, sizeof hint, TR("Лево/Право — буква   %s — добавить   %s — стереть   Вниз — результаты"), KN(ACT_OK), KN(ACT_PAUSE));
+  } else if (g_tab == 3) {
+    if (g_sub == 1) {
+      render_list(&vcat, TR("Выберите фон"));
+      snprintf(hint, sizeof hint, TR("%s — выбрать фон   %s — отмена"), KN(ACT_OK), KN(ACT_BACK));
+    } else {
+      render_settings();
+      if (g_capture) snprintf(hint, sizeof hint, "%s", TR("Нажмите новую кнопку   Select — отмена"));
+      else snprintf(hint, sizeof hint, TR("Вверх/Вниз — выбор   Лево/Право — изменить   %s — применить"), KN(ACT_OK));
+    }
   } else render_about();
   draw_bar(hint);
   draw_toast();
@@ -1031,13 +1308,13 @@ static void open_entry(View *v) {
   switch (e->type) {
     case T_DIR: strcpy(tmp, e->path); load_dir(tmp); break;
     case T_AUDIO:
-      if (is_mp3(e->path)) start_queue(v); else set_msg("Пока поддерживается только MP3");
+      if (is_mp3(e->path)) start_queue(v); else set_msg(TR("Пока поддерживается только MP3"));
       break;
     case T_IMAGE:
-      if (is_viewable(e->path)) photo_viewer(v, v->cursor); else set_msg("Пока поддерживаются JPG и PNG");
+      if (is_viewable(e->path)) photo_viewer(v, v->cursor); else set_msg(TR("Пока поддерживаются JPG и PNG"));
       break;
-    case T_VIDEO: set_msg("Воспроизведение видео будет в следующей версии"); break;
-    default: set_msg("Этот тип файла не поддерживается");
+    case T_VIDEO: set_msg(TR("Воспроизведение видео будет в следующей версии")); break;
+    default: set_msg(TR("Этот тип файла не поддерживается"));
   }
 }
 
@@ -1062,13 +1339,17 @@ static void load_backgrounds(void) {
 
 int main(void) {
   setup_cb();
-  scePowerSetClockFrequency(333, 333, 166);
+  cfg_load();
+  apply_cpu();
+  a_vol = vol_steps[cfg.startvol] * 0x8000 / 100;
+  srand((unsigned)time(NULL));
   gfx_init();
   sceCtrlSetSamplingCycle(0);
   sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
   int at = sceKernelCreateThread("audio", audio_thread, 0x12, 0x10000, PSP_THREAD_ATTR_USER, NULL);
   if (at >= 0) sceKernelStartThread(at, 0, NULL);
   load_backgrounds();
+  if (cfg.bg == 3 && !(cfg.bgpath[0] && load_custom_bg(cfg.bgpath))) cfg.bg = 0;
   init_charset();
   scan_all();
   load_dir("ms0:/");
@@ -1079,9 +1360,32 @@ int main(void) {
     g_frames++;
     unsigned p = read_pad();
 
+    /* emergency: hold Select + Start for 2 seconds to restore the default buttons */
+    {
+      static int rst;
+      if ((held & PSP_CTRL_SELECT) && (held & PSP_CTRL_START)) {
+        if (++rst == 120) { keys_default(); cfg_save(); set_msg(TR("Кнопки сброшены")); dirty = 1; }
+      } else rst = 0;
+    }
+
+    /* waiting for a new button to assign (physical buttons are read directly) */
+    if (g_capture) {
+      if (raw_press & PSP_CTRL_SELECT) { g_capture = 0; dirty = 1; }
+      else {
+        for (int k = 0; k < ACT_N; k++) {
+          if (!(raw_press & LOGICAL[k])) continue;
+          unsigned cand = LOGICAL[k]; int cap = g_capture - 1;
+          for (int a = 0; a < ACT_N; a++) if (a != cap && cfg.keymap[a] == cand) cfg.keymap[a] = cfg.keymap[cap];   // swap on conflict
+          cfg.keymap[cap] = cand; cfg_save(); g_capture = 0; dirty = 1;
+          break;
+        }
+      }
+      p = 0; stick_ev = 0;
+    }
+
     /* analog stick: up/down scroll everywhere; left/right = volume in lists, otherwise like the D-pad */
     {
-      int list_ctx = (g_tab == 1) || (g_tab == 0 && g_sub == 1) || (g_tab == 2 && g_sfocus == 1);
+      int list_ctx = (g_tab == 1) || (g_tab == 0 && g_sub == 1) || (g_tab == 3 && g_sub == 1) || (g_tab == 2 && g_sfocus == 1);
       if (stick_ev & ST_UP) p |= PSP_CTRL_UP;
       if (stick_ev & ST_DOWN) p |= PSP_CTRL_DOWN;
       if (list_ctx) {
@@ -1103,17 +1407,17 @@ int main(void) {
       p &= ~(PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_LEFT | PSP_CTRL_RIGHT);
     }
     if (p & PSP_CTRL_START) { a_stop = 1; nq = 0; dirty = 1; }
-    if (a_finished) { a_finished = 0; fail_run = 0; next_track(1); dirty = 1; }
+    if (a_finished) { a_finished = 0; on_track_finished(); dirty = 1; }
     if (a_failed) {
       a_failed = 0; fail_run++; dirty = 1;
       if (nq == 0 || fail_run >= nq) {
-        char m[96]; snprintf(m, sizeof m, "Не удалось воспроизвести файл (код %d)", a_err);
+        char m[96]; snprintf(m, sizeof m, TR("Не удалось воспроизвести файл (код %d)"), a_err);
         set_msg(m); nq = 0; fail_run = 0;
       } else next_track(1);
     }
 
-    if (p & PSP_CTRL_LTRIGGER) { g_tab = (g_tab + 3) % 4; g_sub = 0; dirty = 1; }
-    if (p & PSP_CTRL_RTRIGGER) { g_tab = (g_tab + 1) % 4; g_sub = 0; dirty = 1; }
+    if (p & PSP_CTRL_LTRIGGER) { g_tab = (g_tab + 4) % 5; g_sub = 0; dirty = 1; }
+    if (p & PSP_CTRL_RTRIGGER) { g_tab = (g_tab + 1) % 5; g_sub = 0; dirty = 1; }
 
     if (g_tab == 0 && g_sub == 0) {
       if (p & PSP_CTRL_LEFT) { g_card = (g_card + 2) % 3; dirty = 1; }
@@ -1157,6 +1461,30 @@ int main(void) {
         view_clamp(&vsrch, ROWS_S);
       }
       if (p) dirty = 1;
+    } else if (g_tab == 3 && g_sub == 0) {          /* settings */
+      if (p & PSP_CTRL_UP) g_set_sel--;
+      if (p & PSP_CTRL_DOWN) g_set_sel++;
+      if (g_set_sel < 0) g_set_sel = 0;
+      if (g_set_sel >= NSITEMS) g_set_sel = NSITEMS - 1;
+      if (p & PSP_CTRL_LEFT) set_change(g_set_sel, -1);
+      if (p & PSP_CTRL_RIGHT) set_change(g_set_sel, 1);
+      if (p & PSP_CTRL_CROSS) set_activate(g_set_sel);
+      if (g_set_sel < g_set_top) g_set_top = g_set_sel;
+      if (g_set_sel >= g_set_top + ROWS_SET) g_set_top = g_set_sel - ROWS_SET + 1;
+      if (p) dirty = 1;
+    } else if (g_tab == 3 && g_sub == 1) {          /* choose background photo */
+      View *v = &vcat;
+      if (p & PSP_CTRL_UP) v->cursor--;
+      if (p & PSP_CTRL_DOWN) v->cursor++;
+      if (p & PSP_CTRL_LEFT) v->cursor -= ROWS_L;
+      if (p & PSP_CTRL_RIGHT) v->cursor += ROWS_L;
+      if ((p & PSP_CTRL_CROSS) && v->n) {
+        Entry *e = v->it[v->cursor];
+        if (is_viewable(e->path)) pick_bg(e->path); else set_msg(TR("Пока поддерживаются JPG и PNG"));
+      }
+      if (p & PSP_CTRL_CIRCLE) g_sub = 0;
+      view_clamp(v, ROWS_L);
+      if (p) dirty = 1;
     }
 
     /* delayed photo preview (JPEG thumbnail of the highlighted file) */
@@ -1167,7 +1495,7 @@ int main(void) {
       if (prev_img) { free(prev_img); prev_img = NULL; }
       prev_wait = 10; dirty = 1;
     } else if (prev_wait > 0 && --prev_wait == 0) {
-      if (ce && ce->type == T_IMAGE && is_jpeg(ce->path) && ce->size < 30u * 1024 * 1024) {
+      if (cfg.preview && ce && ce->type == T_IMAGE && is_jpeg(ce->path) && ce->size < 30u * 1024 * 1024) {
         prev_img = load_thumb(ce->path, &prev_w, &prev_h);
         dirty = 1;
       }
