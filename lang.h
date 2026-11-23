@@ -125,4 +125,13 @@ static const char *const tr_tab[][2] = {
   { "Неподдерживаемый формат", "Unsupported format" },
   { "Формат видео не поддерживается", "Video format is not supported" },
   { "Сейчас: MP3, JPG, PNG, BMP, MP4, AVI, MKV.", "Now: MP3, JPG, PNG, BMP, MP4, AVI, MKV." },
+  { "Плеер", "Player" },
+  { "СЕЙЧАС ИГРАЕТ", "NOW PLAYING" },
+  { "Трек: %d / %d", "Track: %d / %d" },
+  { "Трек: 1 / 1", "Track: 1 / 1" },
+  { "Статус: Пауза", "Status: Paused" },
+  { "Статус: Играет", "Status: Playing" },
+  { "Повтор: %s   •   Перемеш.: %s", "Repeat: %s   •   Shuffle: %s" },
+  { "Громкость: %d%%", "Volume: %d%%" },
+  { "%s пауза   Лево/Право трек   Вверх/Вниз громк.   %s повтор   %s стоп", "%s pause   Left/Right track   Up/Down vol.   %s repeat   %s stop" },
 };

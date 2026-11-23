@@ -5,9 +5,18 @@ CFLAGS = -O2 -G0 -Wall
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 
+PSPDEV_DIR := $(shell psp-config --pspdev-path 2>/dev/null)
 FFMPEG_PKGS = libavformat libavcodec libswscale libswresample libavutil
-FFMPEG_CFLAGS := $(shell psp-pkg-config --cflags $(FFMPEG_PKGS) 2>/dev/null)
-FFMPEG_LIBS   := $(shell psp-pkg-config --libs $(FFMPEG_PKGS) 2>/dev/null)
+FFMPEG_CFLAGS := $(shell PKG_CONFIG_PATH="$(PSPDEV_DIR)/psp/lib/pkgconfig" pkg-config --cflags $(FFMPEG_PKGS) 2>/dev/null)
+FFMPEG_LIBS   := $(shell PKG_CONFIG_PATH="$(PSPDEV_DIR)/psp/lib/pkgconfig" pkg-config --libs $(FFMPEG_PKGS) 2>/dev/null)
+
+ifeq ($(strip $(FFMPEG_LIBS)),)
+ifneq ($(wildcard $(PSPDEV_DIR)/psp/include/libavformat/avformat.h),)
+FFMPEG_CFLAGS = -I$(PSPDEV_DIR)/psp/include
+FFMPEG_LIBS   = -lavformat -lavcodec -lswscale -lswresample -lavutil
+endif
+endif
+
 ifneq ($(strip $(FFMPEG_LIBS)),)
 CFLAGS += -DHAVE_FFMPEG $(FFMPEG_CFLAGS)
 endif

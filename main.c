@@ -1307,22 +1307,24 @@ static void video_player(const char *path) {
 }
 
 /* ================= UI rendering ================= */
-static const char *tabnames[5] = { N_("Главная"), N_("Память PSP"), N_("Поиск"), N_("Настройки"), N_("О приложении") };
+static const char *tabnames[6] = { N_("Главная"), N_("Память PSP"), N_("Поиск"), N_("Настройки"), N_("О приложении"), N_("Плеер") };
 
 static void draw_header(void) {
   fill_rect(0, 0, SW, 27, C_DARK, 155);
   fill_rect(0, 27, SW, 1, C_ACC, 110);
   draw_text(&FONT_L, 8, 1, C_TITLE, "PSP media", 0, 1);
-  int tw[5], sum = 0, x0 = 104;
-  for (int i = 0; i < 5; i++) { tw[i] = text_width(&FONT_M, TR(tabnames[i])); sum += tw[i]; }
-  int gap = (SW - 6 - x0 - sum) / 4;
+  int nt = a_playing ? 6 : 5;
+  int tw[6], sum = 0, x0 = nt == 6 ? 98 : 104;
+  for (int i = 0; i < nt; i++) { tw[i] = text_width(&FONT_M, TR(tabnames[i])); sum += tw[i]; }
+  int gap = (SW - 6 - x0 - sum) / (nt - 1);
   if (gap > 18) gap = 18;
-  if (gap < 4) gap = 4;
+  if (gap < 3) gap = 3;
   int x = x0;
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < nt; i++) {
     int act = (i == g_tab);
-    draw_text(&FONT_M, x, 5, act ? C_WHITE : C_GRAY, TR(tabnames[i]), 0, 1);
-    if (act) fill_rect(x, 23, tw[i], 2, C_WHITE, 255);
+    uint32_t col = act ? C_WHITE : (i == 5 ? C_GREEN : C_GRAY);
+    draw_text(&FONT_M, x, 5, col, TR(tabnames[i]), 0, 1);
+    if (act) fill_rect(x, 23, tw[i], 2, i == 5 ? C_GREEN : C_WHITE, 255);
     x += tw[i] + gap;
   }
 }
@@ -1524,6 +1526,57 @@ static void render_about(void) {
   for (int i = 0; i < 10; i++) draw_text(&FONT_S, 20, 68 + i * 16, i < 2 ? C_WHITE : (i >= 8 ? C_ACC : C_GRAY), ln[i], 440, 0);
 }
 
+
+/* ---- music player tab (visible only while music is playing) ---- */
+static void render_player(void) {
+  fill_rect(10, 34, 460, 202, C_DARK, 155);
+  /* left: cover art box + simple animated bars */
+  fill_vgrad(24, 48, 136, 136, RGB(20, 145, 145), RGB(8, 22, 54));
+  big_icon(T_AUDIO, 92, 104, 30);
+  for (int b = 0; b < 9; b++) {
+    int h = a_pause ? 4 : (4 + (int)((g_frames / 3 + b * 7) % 18));
+    if (h > 18) h = 18;
+    fill_rect(34 + b * 13, 178 - h, 8, h, C_ACC, 210);
+  }
+  rect_border(24, 48, 136, 136, C_ACC, 160, 1);
+
+  /* right: track info */
+  draw_text(&FONT_S, 176, 48, C_ACC, TR("СЕЙЧАС ИГРАЕТ"), 280, 0);
+  draw_wrapped(&FONT_M, 176, 66, 280, 2, C_WHITE, base(a_path));
+
+  char tb[96];
+  if (nq > 0) snprintf(tb, sizeof tb, TR("Трек: %d / %d"), qpos + 1, nq);
+  else snprintf(tb, sizeof tb, TR("Трек: 1 / 1"));
+  draw_text(&FONT_S, 176, 108, C_GRAY, tb, 280, 0);
+
+  draw_text(&FONT_S, 176, 126, a_pause ? C_YELLOW : C_GREEN,
+            a_pause ? TR("Статус: Пауза") : TR("Статус: Играет"), 280, 0);
+
+  const char *rep_s = cfg.rep == 0 ? TR("Выкл") : cfg.rep == 1 ? TR("Все") : TR("Один трек");
+  snprintf(tb, sizeof tb, TR("Повтор: %s   •   Перемеш.: %s"), rep_s, cfg.shuf ? TR("Вкл") : TR("Выкл"));
+  draw_text(&FONT_S, 176, 144, C_GRAY, tb, 280, 0);
+
+  int vp = a_vol * 100 / 0x8000;
+  snprintf(tb, sizeof tb, TR("Громкость: %d%%"), vp);
+  draw_text(&FONT_S, 176, 164, C_WHITE, tb, 140, 0);
+  fill_rect(290, 170, 160, 6, C_WHITE, 45);
+  fill_rect(290, 170, 160 * vp / 100, 6, C_GREEN, 230);
+
+  /* bottom: progress bar & time */
+  int s = a_secs, d = a_dur;
+  char ts[32], td[32];
+  snprintf(ts, sizeof ts, "%02d:%02d", s / 60, s % 60);
+  if (d > 0) snprintf(td, sizeof td, "%02d:%02d", d / 60, d % 60);
+  else strcpy(td, "--:--");
+  draw_text(&FONT_S, 24, 196, C_WHITE, ts, 0, 0);
+  draw_text_r(&FONT_S, 456, 196, C_GRAY, td);
+  fill_rect(24, 216, 432, 6, C_WHITE, 50);
+  if (d > 0) {
+    int pw = 432 * (s > d ? d : s) / d;
+    fill_rect(24, 216, pw, 6, C_ACC, 255);
+  }
+}
+
 /* ---- custom background ---- */
 static int load_custom_bg(const char *path) {
   int w, h;
@@ -1702,7 +1755,13 @@ static void render(void) {
       if (g_capture) snprintf(hint, sizeof hint, "%s", TR("Нажмите новую кнопку   Select — отмена"));
       else snprintf(hint, sizeof hint, TR("Вверх/Вниз — выбор   Лево/Право — изменить   %s — применить"), KN(ACT_OK));
     }
-  } else render_about();
+  } else if (g_tab == 4) {
+    render_about();
+  } else if (g_tab == 5 && a_playing) {
+    render_player();
+    snprintf(hint, sizeof hint, TR("%s пауза   Лево/Право трек   Вверх/Вниз громк.   %s повтор   %s стоп"),
+             KN(ACT_OK), KN(ACT_ALT), KN(ACT_STOP));
+  }
   draw_bar(hint);
   draw_toast();
 }
@@ -1826,8 +1885,12 @@ int main(void) {
       } else next_track(1);
     }
 
-    if (p & PSP_CTRL_LTRIGGER) { g_tab = (g_tab + 4) % 5; g_sub = 0; dirty = 1; }
-    if (p & PSP_CTRL_RTRIGGER) { g_tab = (g_tab + 1) % 5; g_sub = 0; dirty = 1; }
+    if (!a_playing && g_tab == 5) { g_tab = 0; g_sub = 0; dirty = 1; }
+    {
+      int nt = a_playing ? 6 : 5;
+      if (p & PSP_CTRL_LTRIGGER) { g_tab = (g_tab + nt - 1) % nt; g_sub = 0; dirty = 1; }
+      if (p & PSP_CTRL_RTRIGGER) { g_tab = (g_tab + 1) % nt; g_sub = 0; dirty = 1; }
+    }
 
     if (g_tab == 0 && g_sub == 0) {
       if (p & PSP_CTRL_LEFT) { g_card = (g_card + 2) % 3; dirty = 1; }
@@ -1895,6 +1958,15 @@ int main(void) {
       if (p & PSP_CTRL_CIRCLE) g_sub = 0;
       view_clamp(v, ROWS_L);
       if (p) dirty = 1;
+    } else if (g_tab == 5 && a_playing) {           /* music player tab */
+      if (p & (PSP_CTRL_CROSS | PSP_CTRL_SQUARE)) a_pause = !a_pause;
+      if (p & PSP_CTRL_LEFT) next_track(-1);
+      if (p & PSP_CTRL_RIGHT) next_track(1);
+      if (p & PSP_CTRL_UP) vol_change(0x800);
+      if (p & PSP_CTRL_DOWN) vol_change(-0x800);
+      if (p & PSP_CTRL_TRIANGLE) { cfg.rep = (cfg.rep + 1) % 3; cfg_save(); }
+      if (p & PSP_CTRL_CIRCLE) { g_tab = 0; g_sub = 0; }
+      if (p) dirty = 1;
     }
 
     /* delayed photo preview (JPEG thumbnail of the highlighted file) */
@@ -1912,7 +1984,7 @@ int main(void) {
     }
 
     if (msgtimer > 0 && --msgtimer == 0) dirty = 1;
-    if (a_playing && g_frames % 15 == 0) dirty = 1;
+    if (a_playing && (g_frames % (g_tab == 5 ? 6 : 15) == 0)) dirty = 1;
     if (g_tab == 2 && g_frames % 30 == 0) dirty = 1;
 
     if (dirty) { render(); flip(1); dirty = 0; }
