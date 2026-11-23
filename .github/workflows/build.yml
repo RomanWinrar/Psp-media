@@ -15,7 +15,7 @@ jobs:
         run: |
           psp-pacman -Sy --noconfirm libmad libpng zlib || true
           psp-pacman -S --noconfirm libjpeg-turbo || psp-pacman -S --noconfirm libjpeg || true
-          psp-pacman -S --noconfirm ffmpeg || true
+          psp-pacman -S --noconfirm ffmpeg || psp-pacman -S --noconfirm psp-ffmpeg || true
 
       - name: Build
         run: make
