@@ -20,7 +20,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/psp-ffmpeg
-          key: psp-ffmpeg-6.1.2-v1
+          key: psp-ffmpeg-6.1.2-v2
 
       - name: Build minimal FFmpeg for PSP
         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
@@ -50,13 +50,17 @@ jobs:
             --disable-debug \
             --disable-avdevice \
             --disable-avfilter \
+            --disable-bzlib \
+            --disable-lzma \
+            --disable-iconv \
+            --disable-sdl2 \
             --disable-everything \
             --enable-small \
             --enable-protocol=file \
             --enable-demuxer=mov,matroska,avi \
             --enable-parser=h264,mpeg4video,mjpeg,aac,mpegaudio \
             --enable-decoder=h264,mpeg4,mjpeg,aac,mp3,mp3float,pcm_s16le \
-            --extra-cflags="-O2 -G0 -I/usr/local/pspdev/psp/include -I/usr/local/pspdev/psp/sdk/include" \
+            --extra-cflags="-O2 -G0 -Wno-incompatible-pointer-types -I/usr/local/pspdev/psp/include -I/usr/local/pspdev/psp/sdk/include" \
             --extra-ldflags="-L/usr/local/pspdev/psp/lib -L/usr/local/pspdev/psp/sdk/lib"
           make -j$(nproc)
           make install
