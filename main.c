@@ -450,7 +450,8 @@ static int classify(const char *name) {
 }
 static int is_mp3(const char *p) { return has_ext(p, "mp3"); }
 static int is_jpeg(const char *p) { return has_ext(p, "jpg,jpeg"); }
-static int is_viewable(const char *p) { return has_ext(p, "jpg,jpeg,png"); }
+static int is_bmp(const char *p) { return has_ext(p, "bmp"); }
+static int is_viewable(const char *p) { return has_ext(p, "jpg,jpeg,png,bmp"); }
 static const char *base(const char *p) { const char *s = strrchr(p, '/'); return s ? s + 1 : p; }
 static const char *type_upper(int t) {
   return t == T_DIR ? TR("ПАПКА") : t == T_AUDIO ? TR("МУЗЫКА") : t == T_VIDEO ? TR("ВИДЕО") : t == T_IMAGE ? TR("ФОТО") : TR("ФАЙЛ");
@@ -843,10 +844,48 @@ static uint32_t *png_decode(FILE *f, int *ow, int *oh) {
   *ow = w; *oh = h;
   return (uint32_t *)pix;
 }
+/* Small uncompressed BMP decoder (24/32-bit BI_RGB). PSP-friendly and bounded. */
+static unsigned rd16le(FILE *f, int *ok) {
+  int a = fgetc(f), b = fgetc(f);
+  if (a < 0 || b < 0) { *ok = 0; return 0; }
+  return (unsigned)a | ((unsigned)b << 8);
+}
+static unsigned rd32le(FILE *f, int *ok) {
+  unsigned a = rd16le(f, ok), b = rd16le(f, ok);
+  return a | (b << 16);
+}
+static uint32_t *bmp_decode(FILE *f, int *ow, int *oh) {
+  int ok = 1;
+  if (fgetc(f) != 'B' || fgetc(f) != 'M') return NULL;
+  (void)rd32le(f, &ok); (void)rd16le(f, &ok); (void)rd16le(f, &ok);
+  unsigned off = rd32le(f, &ok), dib = rd32le(f, &ok);
+  if (!ok || dib < 40 || dib > 124) return NULL;
+  int32_t wi = (int32_t)rd32le(f, &ok), hi = (int32_t)rd32le(f, &ok);
+  unsigned planes = rd16le(f, &ok), bpp = rd16le(f, &ok);
+  unsigned comp = rd32le(f, &ok);
+  if (!ok || wi <= 0 || hi == 0 || hi == INT32_MIN || planes != 1 ||
+      (bpp != 24 && bpp != 32) || comp != 0) return NULL;
+  int topdown = hi < 0, w = wi, h = hi < 0 ? -hi : hi;
+  if ((unsigned long)w * (unsigned long)h > 3000000UL) return NULL;
+  long rowbytes = ((long)w * (bpp / 8) + 3) & ~3L;
+  unsigned char *row = (unsigned char *)malloc((size_t)rowbytes);
+  uint32_t *pix = (uint32_t *)malloc((size_t)w * h * 4);
+  if (!row || !pix || fseek(f, (long)off, SEEK_SET) != 0) { free(row); free(pix); return NULL; }
+  for (int sy = 0; sy < h; sy++) {
+    if (fread(row, 1, (size_t)rowbytes, f) != (size_t)rowbytes) { free(row); free(pix); return NULL; }
+    int y = topdown ? sy : h - 1 - sy;
+    for (int x = 0; x < w; x++) {
+      unsigned char *q = row + x * (bpp / 8);
+      pix[(size_t)y * w + x] = RGB(q[2], q[1], q[0]);
+    }
+  }
+  free(row); *ow = w; *oh = h; return pix;
+}
 static uint32_t *load_photo(const char *path, int *w, int *h) {
   FILE *f = fopen(path, "rb");
   if (!f) return NULL;
-  uint32_t *r = is_jpeg(path) ? jpeg_decode(f, NULL, 0, w, h, SW, SH, 3000000) : png_decode(f, w, h);
+  uint32_t *r = is_jpeg(path) ? jpeg_decode(f, NULL, 0, w, h, SW, SH, 3000000) :
+                is_bmp(path) ? bmp_decode(f, w, h) : png_decode(f, w, h);
   fclose(f);
   return r;
 }
@@ -1002,7 +1041,7 @@ static void draw_preview(Entry *e) {
   char nb[64]; const char *note = NULL; int warn = 0;
   if (e->type == T_VIDEO) { note = TR("Видео: скоро"); warn = 1; }
   else if (e->type == T_AUDIO && !is_mp3(e->path)) { note = TR("Пока только MP3"); warn = 1; }
-  else if (e->type == T_IMAGE && !is_viewable(e->path)) { note = TR("Пока JPG и PNG"); warn = 1; }
+  else if (e->type == T_IMAGE && !is_viewable(e->path)) { note = TR("Пока JPG, PNG и BMP"); warn = 1; }
   else if (e->type == T_AUDIO) { snprintf(nb, sizeof nb, TR("%s — играть"), KN(ACT_OK)); note = nb; }
   else if (e->type == T_IMAGE) { snprintf(nb, sizeof nb, TR("%s — открыть"), KN(ACT_OK)); note = nb; }
   else if (e->type == T_DIR) { snprintf(nb, sizeof nb, TR("%s — войти"), KN(ACT_OK)); note = nb; }
@@ -1311,7 +1350,7 @@ static void open_entry(View *v) {
       if (is_mp3(e->path)) start_queue(v); else set_msg(TR("Пока поддерживается только MP3"));
       break;
     case T_IMAGE:
-      if (is_viewable(e->path)) photo_viewer(v, v->cursor); else set_msg(TR("Пока поддерживаются JPG и PNG"));
+      if (is_viewable(e->path)) photo_viewer(v, v->cursor); else set_msg(TR("Поддерживаются JPG, PNG и BMP"));
       break;
     case T_VIDEO: set_msg(TR("Воспроизведение видео будет в следующей версии")); break;
     default: set_msg(TR("Этот тип файла не поддерживается"));
@@ -1480,7 +1519,7 @@ int main(void) {
       if (p & PSP_CTRL_RIGHT) v->cursor += ROWS_L;
       if ((p & PSP_CTRL_CROSS) && v->n) {
         Entry *e = v->it[v->cursor];
-        if (is_viewable(e->path)) pick_bg(e->path); else set_msg(TR("Пока поддерживаются JPG и PNG"));
+        if (is_viewable(e->path)) pick_bg(e->path); else set_msg(TR("Поддерживаются JPG, PNG и BMP"));
       }
       if (p & PSP_CTRL_CIRCLE) g_sub = 0;
       view_clamp(v, ROWS_L);
