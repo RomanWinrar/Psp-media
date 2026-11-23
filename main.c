@@ -1202,13 +1202,14 @@ static void video_player_ffmpeg(const char *path) {
   int dur_sec = fmt->duration > 0 ? (int)(fmt->duration / AV_TIME_BASE) : 0;
   uint64_t t0 = 0;
   int64_t pts0 = AV_NOPTS_VALUE;
-  int cur_sec = 0, paused = 0, show_hud = 1, quit = 0;
+  int cur_sec = 0, paused = 0, show_hud = 1, quit = 0, clear_bg = 1;
+  int drop_cnt = 0;
 
   while (!quit && pkt && frame) {
     unsigned p = read_pad();
     if (p & PSP_CTRL_CIRCLE) break;
     if (p & PSP_CTRL_SQUARE) { paused = !paused; pts0 = AV_NOPTS_VALUE; }
-    if (p & PSP_CTRL_TRIANGLE) show_hud = !show_hud;
+    if (p & PSP_CTRL_TRIANGLE) { show_hud = !show_hud; clear_bg = 1; }
     if (p & PSP_CTRL_UP) vol_change(0x800);
     if (p & PSP_CTRL_DOWN) vol_change(-0x800);
     if (p & (PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER)) {
@@ -1217,7 +1218,8 @@ static void video_player_ffmpeg(const char *path) {
       av_seek_frame(fmt, -1, target_s * AV_TIME_BASE, (p & PSP_CTRL_LTRIGGER) ? AVSEEK_FLAG_BACKWARD : 0);
       avcodec_flush_buffers(vctx);
       if (actx) avcodec_flush_buffers(actx);
-      pts0 = AV_NOPTS_VALUE; afill = 0;
+      pts0 = AV_NOPTS_VALUE; afill = 0; clear_bg = 1; drop_cnt = 0;
+      vctx->skip_frame = AVDISCARD_DEFAULT;
     }
 
     if (paused) { sceDisplayWaitVblankStart(); continue; }
@@ -1234,23 +1236,43 @@ static void video_player_ffmpeg(const char *path) {
             if (dw < 2) dw = 2;
             if (dh < 2) dh = 2;
             ox = (SW - dw) / 2; oy = (SH - dh) / 2;
+            /* SWS_POINT is much faster than bilinear on PSP CPU */
             sws = sws_getContext(sws_w, sws_h, (enum AVPixelFormat)sws_fmt,
-                                 dw, dh, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
+                                 dw, dh, AV_PIX_FMT_RGBA, SWS_POINT, NULL, NULL, NULL);
+            clear_bg = 1;
           }
           if (!sws) continue;
 
+          int skip_draw = 0;
           int64_t pts = frame->best_effort_timestamp;
           if (pts != AV_NOPTS_VALUE) {
             int64_t pts_us = av_rescale_q(pts, vtb, (AVRational){ 1, 1000000 });
             if (pts0 == AV_NOPTS_VALUE) { pts0 = pts_us; t0 = sceKernelGetSystemTimeWide(); }
             int64_t target = (int64_t)t0 + (pts_us - pts0);
             int64_t now = (int64_t)sceKernelGetSystemTimeWide();
-            if (target > now && target - now < 500000) sceKernelDelayThread((SceUInt)(target - now));
-            else if (now - target > 500000) { pts0 = pts_us; t0 = (uint64_t)now; }
+            int64_t late = now - target;
+            if (late < 0) {
+              if (-late < 500000) sceKernelDelayThread((SceUInt)(-late));
+              vctx->skip_frame = AVDISCARD_DEFAULT;
+              drop_cnt = 0;
+            } else if (late > 45000 && drop_cnt < 4) {
+              /* frame is late: skip scaling/drawing and drop non-ref B-frames */
+              skip_draw = 1;
+              drop_cnt++;
+              if (late > 100000) vctx->skip_frame = AVDISCARD_NONREF;
+            } else {
+              if (late > 500000) { pts0 = pts_us; t0 = (uint64_t)now; }
+              drop_cnt = 0;
+            }
             cur_sec = (int)(pts_us / 1000000);
           }
 
-          for (int i = 0; i < SW * SH; i++) fb[i] = C_BLACK;
+          if (skip_draw) continue;
+
+          if (clear_bg) {
+            for (int i = 0; i < SW * SH; i++) fb[i] = C_BLACK;
+            clear_bg = 0;
+          }
           uint8_t *dst[4] = { (uint8_t *)(fb + oy * SW + ox), NULL, NULL, NULL };
           int dlns[4] = { SW * 4, 0, 0, 0 };
           sws_scale(sws, (const uint8_t *const *)frame->data, frame->linesize, 0, sws_h, dst, dlns);
